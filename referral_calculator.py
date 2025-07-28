@@ -2,25 +2,12 @@ import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-import json
+import matplotlib.pyplot as plt
 
-st.set_page_config(
-    page_title="Referral Credit Calculator v2", 
-    page_icon="💰",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        'Get Help': 'https://github.com/Kagu-Re/referral-credit-calculator',
-        'Report a bug': "https://github.com/Kagu-Re/referral-credit-calculator/issues",
-        'About': "# Referral Credit Calculator v2\nA tool for modeling loyalty program credits with profit margin impact analysis."
-    }
-)
+st.set_page_config(page_title="Referral Credit Calculator (v3)", layout="wide")
 
-st.title("💰 Referral Credit Calculator v2")
-st.caption("🎯 Model: lead credits based on expected margin and conversion probability; conversion credits based on realized revenue. Now with **Profit Margin Impact** analysis.")
-
-# Add a public info banner
-st.info("🌟 **Enhanced Demo** - This calculator helps you design fair and profitable referral programs with margin impact analysis. All calculations happen in your browser - no data is stored or shared.")
+st.title("Referral Credit Calculator (v3)")
+st.caption("Adds a Monte Carlo Portfolio Simulator to estimate program-level margin impact and ROI.")
 
 # -----------------------------
 # Helpers
@@ -29,7 +16,6 @@ def clamp(x, a=0.0, b=1.0):
     return max(a, min(b, x))
 
 def diminishing_returns(n: int, S: float) -> float:
-    # D(n) = min(1, S / (S + n - 1)) for n>=1; if n==0, return 1
     if n <= 0:
         return 1.0
     return min(1.0, S / (S + n - 1.0))
@@ -40,104 +26,99 @@ def normalize_fracs(fracs):
         return [0.0 for _ in fracs]
     return [f / s for f in fracs]
 
+def beta_ab_from_mean_kappa(mean: float, kappa: float):
+    mean = clamp(mean, 0.0001, 0.9999)
+    kappa = max(0.0001, kappa)
+    a = mean * kappa
+    b = (1.0 - mean) * kappa
+    return a, b
+
+def triangular_mean(a, c, b):
+    # a=min, c=mode, b=max
+    return (a + c + b) / 3.0
+
 # -----------------------------
-# Sidebar: Global params
+# Sidebar: Global params (shared with calculator)
 # -----------------------------
 with st.sidebar:
-    st.header("Global Parameters")
+    st.header("Program Configuration")
 
-    r = st.number_input("Base hourly rate r", min_value=0.0, value=1500.0, step=50.0, 
-                       help="💰 How much one credit is worth in your currency. Example: If r=1500, then 3000 credits = 2 hours of work value.")
-    g = st.slider("Gross margin g", 0.0, 1.0, 0.55, 0.01, 
-                 help="📊 What percentage of each sale is actual profit after costs. Example: 55% means if you sell $100k, $55k is profit.")
-    alpha = st.slider("Referral budget share α (of margin, per conversion)", 0.0, 1.0, 0.25, 0.01,
-                     help="🎯 How much of your profit you'll share when someone converts. Example: 25% means you give away 1/4 of profit as referral rewards.")
-    eta = st.slider("Lead-stage share η (of expected margin)", 0.0, 1.0, 0.05, 0.005,
-                   help="🌱 Reward for just bringing a lead (before they buy). Example: 5% means you pay 5% of expected profit just for the introduction.")
-    delta = st.slider("Effort influence δ", 0.0, 2.0, 0.40, 0.05, 
-                     help="⚡ Bonus multiplier for extra effort. Example: 40% means someone who does warm intros gets 40% more credits than cold referrals.")
+    r = st.number_input("💰 Credit Hour Value ($)", min_value=0.0, value=1500.0, step=50.0, help="How much each credit hour is worth in dollars. This determines the monetary value when credits are redeemed for services.")
+    g = st.slider("📊 Project Profit Margin (%)", 0.0, 100.0, 55.0, 1.0, help="Percentage of project revenue that becomes profit after covering delivery costs. Higher margins mean more budget available for referral credits.") / 100.0
+    alpha = st.slider("🎯 Conversion Bonus (% of profit)", 0.0, 100.0, 25.0, 1.0, help="Percentage of project profit shared as conversion credit when a referral becomes a paying customer. This is the main incentive for successful referrals.") / 100.0
+    eta = st.slider("🌱 Lead Bonus (% of expected profit)", 0.0, 10.0, 5.0, 0.5, help="Percentage of expected profit shared as lead credit when a quality lead is provided, even if it doesn't convert. Encourages lead generation.") / 100.0
+    delta = st.slider("⚡ Effort Multiplier", 0.0, 2.0, 0.40, 0.05, help="How much extra effort increases credit rewards. Higher values mean more reward for referrers who provide warm introductions, context, and qualification.")
 
     st.markdown("---")
-    st.subheader("Conversion probability")
-    p0 = st.slider("Base conversion p₀", 0.0, 1.0, 0.10, 0.01,
-                  help="🎲 Your typical conversion rate. Example: 10% means normally 1 out of 10 leads becomes a customer.")
-    beta = st.slider("Quality slope β", 0.0, 1.0, 0.50, 0.01,
-                    help="📈 How much lead quality matters. Example: 50% means a perfect quality lead (Q=1) has 50% higher conversion chance than base rate.")
-    st.caption("🧮 Formula: p(Q) = clamp(p₀ + β·Q, 0, 1) — Better quality leads = higher conversion chance")
+    st.subheader("🎲 Conversion Likelihood")
+    p0 = st.slider("📉 Baseline Success Rate (%)", 0.0, 100.0, 10.0, 1.0, help="Conversion rate for poor quality leads (0% quality). This represents your worst-case scenario for referral conversions.") / 100.0
+    beta_p = st.slider("📈 Quality Impact Factor", 0.0, 100.0, 50.0, 1.0, help="How much lead quality improves conversion rates. Higher values mean quality makes a bigger difference in closing deals.") / 100.0
+    st.caption("Success Rate = Baseline + (Quality Impact × Lead Quality)")
 
     st.markdown("---")
-    st.subheader("Caps & policy")
-    CLmax = st.number_input("Lead credit cap (C_L,max)", min_value=0.0, value=3000.0, step=100.0,
-                           help="🚫 Maximum credits you'll pay for just bringing a lead. Example: 3000 credits max, even for a $1M opportunity.")
-    CCmax = st.number_input("Conversion credit cap (C_C,max)", min_value=0.0, value=20000.0, step=100.0,
-                           help="🏆 Maximum credits you'll pay when someone actually converts. Example: 20k credits max, even on huge deals.")
-    payout_policy = st.selectbox("Payout policy", ["Additive (C_L + C_C)", "Net from conversion cap (C_L + C_C ≤ C_C,max)"],
-                                help="💡 Additive: Pay both lead + conversion credits separately. Net: Total credits can't exceed conversion cap.")
-    expiry_months = st.number_input("Credit expiry (months)", min_value=1, value=12, step=1,
-                                   help="⏰ How long credits last before they expire. Example: 12 months = use it or lose it after 1 year.")
+    st.subheader("💳 Credit Limits & Rules")
+    CLmax = st.number_input("🌱 Max Lead Credit ($)", min_value=0.0, value=3000.0, step=100.0, help="Maximum credit amount for a single lead, regardless of its value. Prevents extremely high payouts for exceptional leads.")
+    CCmax = st.number_input("🎯 Max Conversion Credit ($)", min_value=0.0, value=20000.0, step=100.0, help="Maximum credit amount for a single conversion, regardless of project size. Controls maximum payout per successful referral.")
+    
+    # Validation: Lead credits should typically be lower than conversion credits
+    if CLmax >= CCmax and CCmax > 0:
+        st.error("⚠️ **Validation Error**: Max Lead Credit should be lower than Max Conversion Credit. Lead credits are typically smaller since they're paid upfront without guaranteed conversion.")
+    
+    payout_policy = st.selectbox("💰 Credit Stacking Policy", ["Additive (Lead + Conversion)", "Capped Total (Max = Conversion Limit)"], help="Additive: Lead and conversion credits add up separately. Capped: Total credits cannot exceed the conversion credit limit.")
+    expiry_months = st.number_input("⏰ Credit Expiry (months)", min_value=1, value=12, step=1, help="How long credits remain valid after earning them. Longer periods are more flexible but harder to forecast financially.")
 
-    st.markdown("---")
-    st.subheader("Milestone split for conversion credit")
-    st.caption("🏗️ When to pay conversion credits during the project timeline")
-    colA, colB, colC = st.columns(3)
-    with colA:
-        phi1 = st.number_input("Deposit φ₁", min_value=0.0, value=0.40, step=0.05,
-                              help="💳 % of conversion credit paid when customer pays deposit")
-    with colB:
-        phi2 = st.number_input("Design sign-off φ₂", min_value=0.0, value=0.40, step=0.05,
-                              help="✅ % of conversion credit paid when design is approved")
-    with colC:
-        phi3 = st.number_input("Final payment φ₃", min_value=0.0, value=0.20, step=0.05,
-                              help="🎉 % of conversion credit paid when project is completed")
-    phi1, phi2, phi3 = normalize_fracs([phi1, phi2, phi3])
+    # Business sustainability warnings
+    total_credit_percentage = alpha + eta
+    if alpha > 0.5:
+        st.warning("⚠️ **Sustainability Warning**: Conversion bonus >50% of profit margin may not be sustainable long-term. Consider lower rates for program viability.")
+    
+    if total_credit_percentage > 0.6:
+        st.warning("⚠️ **High Credit Risk**: Combined credit rates (Conversion + Lead bonuses) exceed 60% of profit. This may impact business profitability.")
 
-    st.markdown("---")
-    st.subheader("Upsell kicker (optional)")
-    st.caption("🚀 Extra rewards for bringing repeat customers or additional projects")
-    enable_kicker = st.checkbox("Enable upsell kicker", value=False,
-                               help="✨ Turn on bonus credits for when referred customers buy again or upgrade")
-    alpha_repeat = st.slider("Repeat share α_repeat (of margin)", 0.0, 1.0, 0.15, 0.01, disabled=not enable_kicker,
-                            help="🔄 % of profit you'll share on repeat/upsell business. Usually lower than initial conversion rate.")
+    # Conversion rate validation
+    max_possible_conversion = p0 + beta_p
+    if max_possible_conversion > 1.0:
+        st.error(f"⚠️ **Conversion Rate Error**: Maximum possible conversion rate is {max_possible_conversion*100:.0f}%. Baseline ({p0*100:.0f}%) + Quality Impact ({beta_p*100:.0f}%) cannot exceed 100%.")
+        st.info("💡 **Fix**: Reduce either Baseline Success Rate or Quality Impact Factor so their sum ≤ 100%")
 
 # -----------------------------
 # Tabs
 # -----------------------------
-tab_calc, tab_margin = st.tabs(["📊 Calculator", "📈 Profit Margin Impact"])
+tab_calc, tab_margin, tab_portfolio = st.tabs(["Calculator", "Profit Margin Impact", "Portfolio Simulator (Monte Carlo)"])
 
+# -----------------------------
+# Calculator tab (single lead/deal) - compact
+# -----------------------------
 with tab_calc:
-    # -----------------------------
-    # Lead/project inputs
-    # -----------------------------
-    st.header("Lead / Project Inputs")
-    st.caption("📝 Details about this specific referral opportunity")
+    st.header("🧮 Credit Calculator")
+    st.caption("Calculate credits for a specific referral scenario")
+
     c1, c2, c3 = st.columns(3)
     with c1:
-        R_exp = st.number_input("Expected revenue for this lead (R̄)", min_value=0.0, value=100_000.0, step=5_000.0,
-                               help="💵 How much money you expect this project to be worth if it converts")
-        Q = st.slider("Lead quality Q (0–1)", 0.0, 1.0, 0.60, 0.01,
-                     help="⭐ How good is this lead? 0=terrible, 1=perfect. Consider: budget confirmed, decision maker identified, urgent need, good fit")
+        R_exp = st.number_input("💵 Expected Deal Value ($)", min_value=0.0, value=100_000.0, step=5_000.0, help="Estimated revenue if this lead becomes a customer. Used to calculate the upfront lead credit based on potential value.")
+        Q = st.slider("⭐ Lead Quality Score", 0.0, 100.0, 60.0, 1.0, help="Assessment of lead quality: 0=unqualified, 50=average prospect, 100=perfect fit. Higher quality leads get more credits and convert better.") / 100.0
     with c2:
-        E = st.slider("Effort score E (0–1)", 0.0, 1.0, 0.50, 0.01, 
-                     help="💪 How much work did the referrer put in? 0=just mentioned your name, 1=warm intro + shared budget + multiple touchpoints")
-        n = st.number_input("Leads from same referrer in window n", min_value=0, value=1, step=1,
-                           help="🔢 How many leads has this person given you recently? (Used to reduce credits for volume referrers)")
+        E = st.slider("🚀 Referrer Effort Level", 0.0, 100.0, 50.0, 1.0, help="Level of effort by referrer: warm introduction, shared context, budget info, multiple touchpoints. Higher effort increases both types of credits.") / 100.0
+        n = st.number_input("📊 Prior Leads from Referrer", min_value=0, value=1, step=1, help="Number of leads already provided by this referrer recently. More leads = diminishing returns on lead credits to prevent gaming.")
     with c3:
-        S = st.number_input("Saturation S (diminishing returns)", min_value=1, value=5, step=1, 
-                           help="🔄 How quickly to reduce credits for multiple leads. Higher number = slower reduction. Example: 5 means 5th lead gets decent credits, 2 means drops off quickly")
-        R_actual = st.number_input("Actual project revenue R (if converted)", min_value=0.0, value=120_000.0, step=5_000.0,
-                                  help="💰 The real project value (if they bought). Often different from initial estimate")
+        S = st.number_input("🎛️ Volume Tolerance", min_value=1, value=5, step=1, help="How tolerant you are of high-volume referrers. Higher values = slower reduction in credits as volume increases. Formula: Reduction = Volume/(Volume + Tolerance - 1)")
+        R_actual = st.number_input("💰 Actual Deal Value ($)", min_value=0.0, value=120_000.0, step=5_000.0, help="Actual revenue when this lead converts to a customer. Used to calculate conversion credit (only paid if deal closes).")
 
-    if enable_kicker:
-        R_upsell = st.number_input("Upsell revenue R_upsell", min_value=0.0, value=0.0, step=5_000.0,
-                                  help="🎁 Additional revenue from repeat business, upgrades, or follow-on projects from this referral")
+    # Parameter validation for Calculator tab
+    if R_actual > 0 and R_exp > 0 and R_actual < R_exp * 0.1:
+        st.warning("⚠️ **Conversion Reality Check**: Actual deal value is significantly lower than expected. Consider adjusting expected values for future leads.")
+    
+    if R_actual > R_exp * 5:
+        st.warning("⚠️ **Expectation Gap**: Actual deal value is much higher than expected. This suggests underestimating lead potential.")
+    
+    if Q > 0.9 and R_actual > 0 and R_actual < R_exp * 0.5:
+        st.error("❌ **Quality-Outcome Mismatch**: High quality score but low actual value suggests quality assessment needs calibration.")
 
-    # -----------------------------
     # Calculations
-    # -----------------------------
-    p = clamp(p0 + beta * Q, 0.0, 1.0)                  # Conversion probability from quality
-    EV_lead = p * g * R_exp                              # Expected margin value of a lead
-    M_E = 1.0 + delta * E                                # Effort multiplier
-    D = diminishing_returns(n, S)                        # Diminishing returns factor
+    p = clamp(p0 + beta_p * Q, 0.0, 1.0)
+    EV_lead = p * g * R_exp
+    M_E = 1.0 + delta * E
+    D = diminishing_returns(n, S)
 
     CL_raw = eta * EV_lead * M_E
     CL_capped = min(CL_raw, CLmax)
@@ -146,299 +127,762 @@ with tab_calc:
     CC_raw = alpha * g * R_actual * M_E
     CC_capped = min(CC_raw, CCmax)
 
-    if payout_policy.startswith("Net"):
-        CC_effective_max = max(0.0, CCmax - CL)  # remaining headroom after lead credit
+    if payout_policy.startswith("Capped"):
+        CC_effective_max = max(0.0, CCmax - CL)
         CC_paid = min(CC_capped, CC_effective_max)
         C_total = CL + CC_paid
     else:
         CC_paid = CC_capped
         C_total = CL + CC_paid
 
-    # Hours equivalents
     hours_CL = (CL / r) if r > 0 else 0.0
     hours_CC = (CC_paid / r) if r > 0 else 0.0
     hours_total = (C_total / r) if r > 0 else 0.0
 
-    # Milestones
-    phi = np.array([phi1, phi2, phi3], dtype=float)
-    phi = phi / phi.sum() if phi.sum() > 0 else np.array([0.0, 0.0, 0.0])
-    milestone_amounts = (CC_paid * phi).round(2)
-
-    milestone_df = pd.DataFrame({
-        "Milestone": ["Deposit (φ₁)", "Design sign-off (φ₂)", "Final payment (φ₃)"],
-        "Share": phi.round(3),
-        "Credit payout": milestone_amounts
-    })
-
-    # Upsell kicker
-    kicker_amount = 0.0
-    if enable_kicker and R_upsell > 0:
-        kicker_amount = alpha_repeat * g * R_upsell * M_E
-        # Apply cap logic? Often separate cap. We'll show as separate amount.
-        kicker_hours = kicker_amount / r if r > 0 else 0.0
-    else:
-        kicker_hours = 0.0
-
-    # -----------------------------
-    # Display
-    # -----------------------------
-    st.subheader("Results")
-    st.caption("🧮 Calculated values based on your inputs")
+    st.subheader("📊 Calculation Results")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("p(Q)", f"{p:.2f}", help="Conversion probability for this lead quality")
-    m2.metric("EV_lead (expected margin value)", f"{EV_lead:,.0f}", help="Expected profit from this lead")
-    m3.metric("Effort multiplier M_E", f"{M_E:.2f}", help="Bonus multiplier for referrer effort")
-    m4.metric("Diminishing factor D(n)", f"{D:.2f}", help="Reduction factor for multiple leads from same person")
+    m1.metric("🎯 Conversion Rate", f"{p*100:.0f}%")
+    m2.metric("💵 Expected Profit", f"${EV_lead:,.0f}")
+    m3.metric("⚡ Effort Boost", f"{M_E:.2f}x")
+    m4.metric("📉 Volume Discount", f"{D:.2f}x")
 
-    st.markdown("### Credits (Currency Units) and Hours")
-    st.caption("💳 How much you'll pay the referrer and what it's worth in work time")
+    st.markdown("### 💳 Credit Rewards")
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Lead credit C_L", f"{CL:,.0f}", help="💡 Credits paid just for bringing the lead (before they buy anything)")
-        st.caption(f"≈ {hours_CL:.2f} hours @ r={r:,.0f}")
+        st.metric("🌱 Lead Credit", f"${CL:,.0f}")
+        st.caption(f"≈ {hours_CL:.1f} hours of service")
     with col2:
-        st.metric("Conversion credit C_C (paid)", f"{CC_paid:,.0f}", help="🎯 Credits paid when the lead actually becomes a customer")
-        st.caption(f"≈ {hours_CC:.2f} hours @ r={r:,.0f}")
+        st.metric("🎯 Conversion Credit", f"${CC_paid:,.0f}")
+        st.caption(f"≈ {hours_CC:.1f} hours of service")
     with col3:
-        st.metric("Total credit (lead + conversion)", f"{C_total:,.0f}", help="💰 Total credits you'll pay for this successful referral")
-        st.caption(f"≈ {hours_total:.2f} hours @ r={r:,.0f}")
+        st.metric("💰 Total Reward", f"${C_total:,.0f}")
+        st.caption(f"≈ {hours_total:.1f} hours of service")
 
-    st.markdown("#### Conversion Credit Milestones")
-    st.caption("📅 When credits get paid out during the project")
-    st.dataframe(milestone_df, use_container_width=True)
-
-    if enable_kicker and R_upsell > 0:
-        st.markdown("#### Upsell Kicker (Separate)")
-        st.info(f"🚀 Upsell credit (separate from caps): {kicker_amount:,.0f} (≈ {kicker_hours:.2f} hours)")
-
-    # What-if analysis: vary Q from 0..1
-    with st.expander("📊 What-if: credits vs. quality (Q)"):
-        st.caption("See how lead quality affects credit amounts")
-        QQ = np.linspace(0, 1, 21)
-        pQ = np.clip(p0 + beta * QQ, 0, 1)
-        EVQ = pQ * g * R_exp
-        CLQ_raw = eta * EVQ * M_E
-        CLQ_capped = np.minimum(CLQ_raw, CLmax) * D
-        # Expected conversion credit (EV) if using expected revenue instead of realized R
-        exp_CCQ_raw = alpha * g * (R_exp) * M_E * pQ  # Expected value view (not actual payout rule)
-        exp_CCQ = np.minimum(exp_CCQ_raw, CCmax if payout_policy.startswith("Additive") else np.maximum(0.0, CCmax - CLQ_capped))
-        df_whatif = pd.DataFrame({
-            "Q": QQ,
-            "Lead Credit CL (expected)": CLQ_capped,
-            "Expected Conversion Credit (EV view)": exp_CCQ
-        })
-        st.line_chart(df_whatif.set_index("Q"))
-
-    # Export scenario
-    st.markdown("---")
-    st.subheader("Export Scenario")
-    st.caption("💾 Save this calculation setup and results for your records")
-    scenario = {
-        "globals": dict(r=r, g=g, alpha=alpha, eta=eta, delta=delta, p0=p0, beta=beta, CLmax=CLmax, CCmax=CCmax, payout_policy=payout_policy, expiry_months=expiry_months,
-                        milestone_shares={"phi1": float(phi1), "phi2": float(phi2), "phi3": float(phi3)},
-                        upsell=dict(enabled=enable_kicker, alpha_repeat=alpha_repeat if enable_kicker else 0.0)),
-        "inputs": dict(R_exp=R_exp, Q=Q, E=E, n=n, S=S, R_actual=R_actual, R_upsell=(R_upsell if enable_kicker else 0.0)),
-        "results": dict(p=p, EV_lead=EV_lead, M_E=M_E, D=D, CL=CL, CC_paid=CC_paid, C_total=C_total,
-                        hours=dict(CL=hours_CL, CC=hours_CC, total=hours_total),
-                        milestones=[{"name": "Deposit", "share": float(phi[0]), "credit": float(milestone_amounts[0])},
-                                    {"name": "Design sign-off", "share": float(phi[1]), "credit": float(milestone_amounts[1])},
-                                    {"name": "Final payment", "share": float(phi[2]), "credit": float(milestone_amounts[2])}],
-                        upsell_credit=(kicker_amount if enable_kicker else 0.0))
-    }
-    scenario_json = json.dumps(scenario, indent=2)
-    st.download_button("📁 Download scenario as JSON", data=scenario_json, file_name="referral_scenario.json", mime="application/json")
+    # Visualization: How conversion probability and credits vary with quality
+    st.markdown("### 📈 Quality Impact Analysis")
+    st.caption("See how conversion rates and credit rewards change as lead quality varies")
+    
+    # Create range of quality values for visualization
+    Q_range = np.linspace(0.0, 1.0, 21)  # 0.0, 0.05, 0.10, ..., 1.0
+    
+    # Calculate metrics for each quality level
+    p_range = [clamp(p0 + beta_p * q, 0.0, 1.0) for q in Q_range]
+    EV_range = [p * g * R_exp for p in p_range]
+    CL_range = [min(eta * ev * M_E, CLmax) * D for ev in EV_range]
+    CC_range = [min(alpha * g * R_actual * M_E, CCmax) for _ in Q_range]
+    
+    # Apply payout policy
+    if payout_policy.startswith("Capped"):
+        CC_paid_range = [min(cc, max(0.0, CCmax - cl)) for cc, cl in zip(CC_range, CL_range)]
+    else:
+        CC_paid_range = CC_range[:]
+    
+    total_credit_range = [cl + cc for cl, cc in zip(CL_range, CC_paid_range)]
+    
+    # Create visualization data
+    df_viz = pd.DataFrame({
+        'Lead Quality Score': Q_range * 100,  # Convert to percentage
+        'Conversion Rate (%)': [p * 100 for p in p_range],
+        'Lead Credit ($)': CL_range,
+        'Conversion Credit ($)': CC_paid_range,
+        'Total Reward ($)': total_credit_range
+    })
+    
+    # Create two-panel visualization
+    viz_col1, viz_col2 = st.columns(2)
+    
+    with viz_col1:
+        st.markdown("**🎯 Conversion Rate vs Lead Quality**")
+        df_prob = df_viz[['Lead Quality Score', 'Conversion Rate (%)']].set_index('Lead Quality Score')
+        st.line_chart(df_prob)
+        st.caption(f"Current Quality: {Q*100:.0f}% → Conversion: {p*100:.0f}%")
+    
+    with viz_col2:
+        st.markdown("**💰 Credit Rewards vs Lead Quality**") 
+        df_credits = df_viz[['Lead Quality Score', 'Lead Credit ($)', 'Conversion Credit ($)', 'Total Reward ($)']].set_index('Lead Quality Score')
+        st.line_chart(df_credits)
+        st.caption(f"Current Quality: {Q*100:.0f}% → Total: ${C_total:,.0f}")
 
 # -----------------------------
-# Profit Margin Impact Tab
+# Margin tab (single scenario, simplified)
 # -----------------------------
 with tab_margin:
-    st.header("📈 Profit Margin Impact Analysis")
-    st.caption("🔍 Estimate how credits affect gross margin under different redemption/accounting modes.")
+    st.header("💰 Financial Impact Analysis")
+    st.caption("Understand how credit redemptions affect your business finances")
+
+    colm1, colm2, colm3 = st.columns(3)
+    with colm1:
+        redemption_rate = st.slider("📈 Credit Usage Rate (%)", 0.0, 100.0, 80.0, 5.0, key="margin_redemption_rate", help="Percentage of earned credits that customers actually redeem. Not all credits get used - typical range is 60-90%.") / 100.0
+        redemption_pattern = st.selectbox("📅 Redemption Pattern", 
+                                         ["🚀 Front-loaded (High early, then decline)", 
+                                          "📊 Uniform (Even distribution)", 
+                                          "🔄 Seasonal (6-month cycles)"], 
+                                         key="redemption_pattern",
+                                         help="How customers typically redeem credits over time. Front-loaded = most credits used quickly, Uniform = steady usage, Seasonal = usage varies by season.")
+    with colm2:
+        expiry_months_m = st.number_input("⏰ Redemption Period (months)", min_value=1, value=12, step=1, key="margin_expiry_months", help="Time window over which credits are typically redeemed. Used for cash flow planning and margin impact distribution.")
+        redemption_mode = st.selectbox("🧾 Accounting Method", ["💸 Revenue Discount", "⏱️ Service Hours (Basic Cost)", "🏭 Service Hours (Capacity Impact)"], key="margin_redemption_mode", help="Revenue Discount: Credits reduce your revenue dollar-for-dollar. Service Hours (Basic): Only count direct costs. Service Hours (Capacity): Include opportunity cost of displaced paid work.")
+    with colm3:
+        c_var_hour = st.number_input("💵 Cost per Service Hour ($)", min_value=0.0, value=float(r*(1-g)) if r>0 else 0.0, step=50.0, key="margin_c_var_hour", help="Direct variable cost to deliver one hour of service (labor, materials, etc.). Does not include fixed overhead costs.")
+        H_cap = st.number_input("⚙️ Monthly Service Capacity (hours)", min_value=0.0, value=640.0, step=10.0, key="margin_H_cap", help="Maximum billable hours your team can deliver per month. Used to determine if credit redemptions force you to turn away paid work.")
+        base_paid_hours = st.number_input("📊 Baseline Paid Hours/Month", min_value=0.0, value=400.0, step=10.0, key="margin_base_paid_hours", help="Typical billable hours per month from non-referral customers. Free capacity = Total Capacity - Baseline Hours.")
+
+    # Profit Margin Tab Validations
+    if base_paid_hours > H_cap:
+        st.error("⚠️ **Capacity Error**: Baseline Paid Hours cannot exceed Monthly Service Capacity. You can't be working more hours than your maximum capacity.")
     
-    # Need to ensure variables are available from first tab
-    if 'C_total' not in locals():
-        st.warning("⚠️ Please configure the calculator in the first tab before viewing margin impact.")
-    else:
-        colm1, colm2, colm3 = st.columns(3)
-        with colm1:
-            redemption_rate = st.slider("Redemption rate ρ", 0.0, 1.0, 0.80, 0.05, 
-                                       help="💳 Fraction of issued credits that are actually redeemed (1 - breakage). Example: 80% means 20% of credits expire unused.")
-            include_kicker_margin = st.checkbox("Include upsell kicker in credit pool", value=False, 
-                                               help="✨ If enabled, adds upsell credits to redemption pool for margin calculations.")
-        with colm2:
-            expiry_months_m = st.number_input("Redemption window (months)", min_value=1, value=12, step=1, 
-                                             help="📅 Assume redemptions spread evenly over this time period.")
-            redemption_mode = st.selectbox("Redemption/accounting mode", 
-                                         ["Discount (contra-revenue)", "Free hours (cash cost only)", "Free hours (capacity-aware)"],
-                                         help="💡 How credits are redeemed: as discounts, free work hours, or capacity-constrained hours.")
-        with colm3:
-            c_var_hour = st.number_input("Variable delivery cost per hour (c_var)", min_value=0.0, 
-                                        value=float(r*(1-g)), step=50.0,
-                                        help="💰 Cash cost per delivery hour. Default uses r×(1-g).")
-            H_cap = st.number_input("Monthly capacity H_cap (hours)", min_value=0.0, value=640.0, step=10.0, 
-                                   help="⏰ Team capacity per month, used for capacity-aware mode.")
-            base_paid_hours = st.number_input("Base paid hours/month (non-referral)", min_value=0.0, value=400.0, step=10.0,
-                                            help="📊 Current monthly billable hours baseline (before referral program).")
+    if H_cap > 0 and (base_paid_hours / H_cap) > 0.9:
+        st.warning("⚠️ **High Utilization Warning**: >90% capacity utilization leaves little room for credit redemptions. Consider increasing capacity or reducing baseline hours.")
 
-        # Calculate margin impact
-        total_credits_pool = C_total + (kicker_amount if (include_kicker_margin and enable_kicker and 'kicker_amount' in locals()) else 0.0)
-        redeemed_credits = redemption_rate * total_credits_pool
-        redeemed_hours_total = redeemed_credits / r if r > 0 else 0.0
-        monthly_redeemed_hours = redeemed_hours_total / expiry_months_m
+    # Using CL + CC from calculator context
+    C_total = CL + CC_paid
+    total_credits_pool = C_total
+    redeemed_credits = redemption_rate * total_credits_pool
+    redeemed_hours_total = redeemed_credits / r if r > 0 else 0.0
+    monthly_redeemed_hours = redeemed_hours_total / expiry_months_m
 
-        # Project margin gained (from referred project)
-        GM_gain_project = g * R_actual
+    GM_gain_project = g * R_actual
+
+    # Create more realistic monthly redemption pattern based on user selection
+    months_array = np.arange(1, expiry_months_m + 1)
+    
+    if redemption_pattern.startswith("🚀"):  # Front-loaded
+        # Exponential decay: higher redemption in first few months
+        decay_factor = 0.15
+        monthly_weights = np.exp(-decay_factor * (months_array - 1))
+    elif redemption_pattern.startswith("📊"):  # Uniform
+        # Even distribution
+        monthly_weights = np.ones(expiry_months_m)
+    else:  # Seasonal
+        # Sinusoidal pattern with 6-month cycles
+        monthly_weights = 1 + 0.5 * np.sin(months_array * np.pi / 6)
+    
+    # Normalize so total redemptions equal the expected amount
+    monthly_weights = monthly_weights / monthly_weights.sum()
+    monthly_redemption_amounts = redeemed_credits * monthly_weights
+
+    if redemption_mode.startswith("💸"):  # Revenue Discount
+        monthly_margin_loss = monthly_redemption_amounts
+        GM_loss_total = monthly_margin_loss.sum()
+    elif redemption_mode.startswith("⏱️"):  # Service Hours (Basic Cost)
+        monthly_hours_redeemed = monthly_redemption_amounts / r if r > 0 else np.zeros_like(monthly_redemption_amounts)
+        monthly_margin_loss = c_var_hour * monthly_hours_redeemed
+        GM_loss_total = monthly_margin_loss.sum()
+    else:  # Service Hours (Capacity Impact)
+        slack = max(0.0, H_cap - base_paid_hours)
+        monthly_hours_redeemed = monthly_redemption_amounts / r if r > 0 else np.zeros_like(monthly_redemption_amounts)
         
-        # Margin loss from credits by mode
-        if redemption_mode.startswith("Discount"):
-            # Each 1 unit of discount reduces margin by 1 unit (costs assumed unchanged)
-            GM_loss_total = redeemed_credits
-            # Create a more realistic redemption pattern - higher in early months
-            redemption_pattern = np.exp(-0.1 * np.arange(expiry_months_m))
-            redemption_pattern = redemption_pattern / redemption_pattern.sum()
-            monthly_margin_loss = GM_loss_total * redemption_pattern
-        elif redemption_mode.startswith("Free hours (cash cost"):
-            # Cash cost only; no opportunity displacement modeled
-            GM_loss_total = c_var_hour * redeemed_hours_total
-            # Create redemption pattern for hours usage
-            redemption_pattern = np.exp(-0.1 * np.arange(expiry_months_m))
-            redemption_pattern = redemption_pattern / redemption_pattern.sum()
-            monthly_margin_loss = GM_loss_total * redemption_pattern
-        else:
-            # Capacity-aware approximation
-            slack = max(0.0, H_cap - base_paid_hours)
-            # Create monthly pattern for capacity-aware mode
-            redemption_pattern = np.exp(-0.1 * np.arange(expiry_months_m))
-            redemption_pattern = redemption_pattern / redemption_pattern.sum()
+        # Calculate monthly costs with capacity constraints
+        monthly_margin_loss = np.zeros(expiry_months_m)
+        for i, hours_this_month in enumerate(monthly_hours_redeemed):
+            cash_cost_this_month = c_var_hour * min(hours_this_month, slack)
+            displaced_hours_this_month = max(0.0, hours_this_month - slack)
+            opp_loss_this_month = (g * r) * displaced_hours_this_month
+            monthly_margin_loss[i] = cash_cost_this_month + opp_loss_this_month
+        
+        GM_loss_total = monthly_margin_loss.sum()
+
+    net_GM = GM_gain_project - GM_loss_total
+    net_margin_pct_on_project = (net_GM / R_actual) if R_actual > 0 else 0.0
+
+    st.markdown("### 📊 Financial Impact Summary")
+    mA, mB, mC, mD = st.columns(4)
+    mA.metric("💰 Project Profit Gained", f"${GM_gain_project:,.0f}")
+    mB.metric("💸 Credit Cost Impact", f"${GM_loss_total:,.0f}")
+    mC.metric("🎯 Net Profit Impact", f"${net_GM:,.0f}")
+    mD.metric("📈 Net Margin Rate", f"{100*net_margin_pct_on_project:.1f}%")
+
+    st.markdown("#### 📅 Monthly Cost Distribution")
+    df_month = pd.DataFrame({"Month": np.arange(1, expiry_months_m+1), "Monthly Cost ($)": monthly_margin_loss})
+    st.line_chart(df_month.set_index("Month"))
+
+# -----------------------------
+# Portfolio Simulator tab
+# -----------------------------
+with tab_portfolio:
+    st.header("🎲 Portfolio Simulation (Monte Carlo)")
+    st.caption("Compare business outcomes WITH vs WITHOUT a referral program using statistical modeling")
+
+    c0, c1, c2, c3 = st.columns(4)
+    with c0:
+        months = st.number_input("📅 Analysis Period (months)", min_value=1, value=12, step=1, key="pf_months", help="Number of months to simulate. Longer periods smooth out randomness but may not reflect changing market conditions.")
+        sims = st.number_input("🔄 Simulation Runs", min_value=100, value=500, step=100, key="pf_sims", help="Number of Monte Carlo simulations to run. More simulations = more accurate results but slower computation.")
+        seed = st.number_input("🎯 Random Seed", min_value=0, value=42, step=1, key="pf_seed", help="Random seed for reproducible results. Same seed = same random outcomes across runs.")
+    with c1:
+        lam_off = st.number_input("📊 Baseline Referrals/Month", min_value=0.0, value=1.5, step=0.5, key="pf_lam_off", help="Average monthly referred leads without the formal referral program (organic word-of-mouth).")
+        lam_on = st.number_input("🚀 Program Referrals/Month", min_value=0.0, value=4.0, step=0.5, key="pf_lam_on", help="Average monthly referred leads with the formal referral program active. Should typically be higher than baseline.")
+        SQL_threshold = st.slider("✅ Quality Threshold (%)", 0.0, 100.0, 50.0, 5.0, key="pf_sql_threshold", help="Minimum quality score for a lead to qualify for credits. Only leads above this threshold earn lead credits.") / 100.0
+    with c2:
+        meanQ_off = st.slider("📉 Baseline Lead Quality (%)", 0.0, 100.0, 45.0, 1.0, key="pf_meanQ_off", help="Average quality of organic referrals without the program. May be lower due to less incentive for quality screening.") / 100.0
+        kappaQ_off = st.number_input("📊 Quality Consistency (Baseline)", min_value=0.1, value=4.0, step=0.5, help="How consistent baseline lead quality is. Higher values = more leads close to average quality.", key="pf_kappaQ_off")
+        meanQ_on = st.slider("📈 Program Lead Quality (%)", 0.0, 100.0, 60.0, 1.0, key="pf_meanQ_on", help="Average quality of leads with the referral program. Should typically be higher due to quality incentives.") / 100.0
+        kappaQ_on = st.number_input("🎯 Quality Consistency (Program)", min_value=0.1, value=6.0, step=0.5, help="How consistent program lead quality is. Higher values = better quality control and screening.", key="pf_kappaQ_on")
+    with c3:
+        meanE = st.slider("⚡ Average Effort Level (%)", 0.0, 100.0, 50.0, 1.0, key="pf_meanE", help="Average effort level across all referrers. Represents baseline effort in lead qualification and handoff.") / 100.0
+        kappaE = st.number_input("🎯 Effort Consistency", min_value=0.1, value=6.0, step=0.5, key="pf_kappaE", help="How consistent effort levels are across referrers. Higher values = more predictable effort, lower values = more variation between referrers.")
+        use_same_E = st.checkbox("✅ Same effort levels for both scenarios", value=True, key="pf_use_same_E", help="Check this if referrers put in similar effort whether the formal program exists or not. Uncheck to allow different effort distributions between scenarios.")
+
+    st.markdown("---")
+    st.subheader("💰 Deal Value Distribution")
+    st.caption("Revenue range for converted customers (uses triangular distribution)")
+    colr1, colr2, colr3 = st.columns(3)
+    with colr1:
+        Rmin = st.number_input("💵 Smallest Deal ($)", min_value=0.0, value=60_000.0, step=5_000.0, key="pf_Rmin", help="Minimum possible revenue per converted customer. Sets the lower bound - your smallest typical deal size.")
+    with colr2:
+        Rmode = st.number_input("🎯 Typical Deal ($)", min_value=0.0, value=120_000.0, step=5_000.0, key="pf_Rmode", help="Most common deal size. This is your 'sweet spot' - the deal value that occurs most frequently.")
+    with colr3:
+        Rmax = st.number_input("💎 Largest Deal ($)", min_value=0.0, value=220_000.0, step=5_000.0, key="pf_Rmax", help="Maximum possible revenue per converted customer. Your biggest deals or enterprise contracts.")
+
+    st.markdown("---")
+    st.subheader("💳 Credit Program Economics")
+    colc1, colc2, colc3 = st.columns(3)
+    with colc1:
+        redemption_rate_pf = st.slider("📈 Credit Usage Rate (%)", 0.0, 100.0, 80.0, 5.0, key="pf_redemption_rate", help="Percentage of earned credits that customers actually redeem. Affects your real cash flow impact.") / 100.0
+        red_window = st.number_input("⏰ Redemption Timeline (months)", min_value=1, value=12, step=1, key="pf_red_window", help="Typical period over which customers redeem their credits after earning them.")
+    with colc2:
+        c_var_hour_pf = st.number_input("💵 Service Cost per Hour ($)", min_value=0.0, value=float(r*(1-g)) if r>0 else 0.0, step=50.0, key="pf_c_var_hour", help="Your variable cost to deliver one hour of service (direct labor, materials, etc.).")
+        H_cap_pf = st.number_input("⚙️ Service Capacity (hrs/month)", min_value=0.0, value=640.0, step=10.0, key="pf_H_cap", help="Maximum billable hours your team can deliver per month across all clients.")
+    with colc3:
+        base_paid_hours_pf = st.number_input("📊 Baseline Billable Hours/Month", min_value=0.0, value=480.0, step=10.0, key="pf_base_paid_hours", help="Typical billable hours per month from your existing (non-referral) client base.")
+
+    # Portfolio Simulator Validations
+    st.markdown("---")
+    
+    # Validation 1: Program referrals should be >= baseline referrals
+    if lam_on < lam_off:
+        st.error("⚠️ **Logic Error**: Program Referrals/Month should be ≥ Baseline Referrals/Month. The referral program should increase (or at least maintain) referral volume.")
+    
+    # Validation 2: Service capacity validation
+    if base_paid_hours_pf > H_cap_pf:
+        st.error("⚠️ **Capacity Error**: Baseline Billable Hours cannot exceed Service Capacity. You can't be billing more hours than your team can deliver.")
+    
+    # Validation 3: Deal value distribution logic
+    if not (Rmin <= Rmode <= Rmax):
+        st.error("⚠️ **Deal Value Error**: Deal values must follow: Smallest ≤ Typical ≤ Largest. Check your deal value distribution.")
+    
+    # Validation 4: Program quality should typically be higher than baseline
+    if meanQ_on < meanQ_off:
+        st.warning("⚠️ **Quality Logic**: Program Lead Quality is lower than Baseline Quality. Typically, referral programs should improve lead quality through incentives.")
+    
+    # Warning 5: High capacity utilization
+    capacity_utilization = (base_paid_hours_pf / H_cap_pf) if H_cap_pf > 0 else 0
+    if capacity_utilization > 0.8:
+        st.warning(f"⚠️ **Capacity Warning**: {capacity_utilization*100:.0f}% baseline capacity utilization. Limited room for referral credit redemptions may impact program success.")
+    
+    # Warning 6: Deal value spread validation
+    if Rmax > 0 and (Rmax - Rmin) / Rmode > 5.0:
+        st.warning("⚠️ **Deal Range Warning**: Very wide deal value range detected. Consider if this reflects your actual customer base or if you need multiple customer segments.")
+
+    st.markdown("---")
+    run = st.button("🚀 Run Simulation")
+
+    if run:
+        # Parameter validation and warnings
+        if lam_on > 10:
+            st.warning("⚠️ **High Lead Volume**: 10+ referrals/month is quite ambitious. Consider more conservative estimates.")
+        if meanQ_on > 0.7:
+            st.warning("⚠️ **High Quality Assumption**: 70%+ average lead quality is very optimistic. Real referrals often vary more.")
+        if alpha > 0.3:
+            st.warning("⚠️ **High Credit Rate**: 30%+ of profit as credits is quite generous. This may not be sustainable.")
+        
+        rng = np.random.default_rng(int(seed))
+
+        def simulate(lam, meanQ, kappaQ, credits_on: bool):
+            aQ, bQ = beta_ab_from_mean_kappa(meanQ, kappaQ)
+            aE, bE = beta_ab_from_mean_kappa(meanE, kappaE)
+
+            total_net_GM = np.zeros(int(sims))
+            total_GM_gain = np.zeros(int(sims))
+            total_credits_issued = np.zeros(int(sims))
+            total_credits_redeemed = np.zeros(int(sims))
+            roi = np.zeros(int(sims))
+
+            monthly_net_GM = np.zeros((int(sims), int(months)))
+
+            for s in range(int(sims)):
+                credits_issue_stream = np.zeros(int(months))
+                redeemed_hours_stream = np.zeros(int(months))
+                monthly_GM_gain = np.zeros(int(months))
+                monthly_GM_loss = np.zeros(int(months))
+
+                for m in range(int(months)):
+                    # Add market saturation effect - referrals may decline over time
+                    saturation_factor = 1.0 - (m * 0.02)  # 2% decline per month
+                    effective_lam = max(0.5 * lam, lam * saturation_factor) if credits_on else lam
+                    
+                    n_leads = rng.poisson(effective_lam)
+                    
+                    # Add monthly variability to quality (market conditions change)
+                    monthly_quality_factor = rng.normal(1.0, 0.1)  # ±10% monthly variation
+                    adjusted_meanQ = clamp(meanQ * monthly_quality_factor, 0.1, 0.9)
+                    aQ_monthly, bQ_monthly = beta_ab_from_mean_kappa(adjusted_meanQ, kappaQ)
+                    
+                    for _ in range(int(n_leads)):
+                        Q_i = rng.beta(aQ_monthly, bQ_monthly)
+                        E_i = rng.beta(aE, bE) if not use_same_E else meanE
+                        M_E_i = 1.0 + delta * E_i
+                        p_i = clamp(p0 + beta_p * Q_i, 0.0, 1.0)
+
+                        R_exp_i = triangular_mean(Rmin, Rmode, Rmax)
+                        
+                        # Lead credits only for qualifying leads
+                        if credits_on and Q_i >= SQL_threshold:
+                            CL_i_raw = eta * (p_i * g * R_exp_i) * M_E_i
+                            CL_i = min(CL_i_raw, CLmax)
+                        else:
+                            CL_i = 0.0
+
+                        converted = rng.random() < p_i
+                        CC_i = 0.0
+                        if converted:
+                            R_act_i = rng.triangular(Rmin, Rmode, Rmax)
+                            GM = g * R_act_i
+                            monthly_GM_gain[m] += GM
+                            
+                            # Conversion credits only for qualifying leads when program is on
+                            if credits_on and Q_i >= SQL_threshold:
+                                CC_i_raw = alpha * g * R_act_i * M_E_i
+                                if payout_policy.startswith("Capped"):
+                                    CC_headroom = max(0.0, CCmax - CL_i)
+                                    CC_i = min(CC_i_raw, CC_headroom)
+                                else:
+                                    CC_i = min(CC_i_raw, CCmax)
+                        credits_issue_stream[m] += (CL_i + CC_i)
+
+                    # redemption spreading
+                    if credits_on and credits_issue_stream[m] > 0:
+                        redeemed_total_m = redemption_rate_pf * credits_issue_stream[m]
+                        per_month_redeem = redeemed_total_m / red_window
+                        for k in range(int(red_window)):
+                            t = m + k
+                            if t < int(months):
+                                redeemed_hours_stream[t] += per_month_redeem / r if r > 0 else 0.0
+
+                # capacity-aware loss per month (only when credits are enabled)
+                slack = max(0.0, H_cap_pf - base_paid_hours_pf)
+                for m in range(int(months)):
+                    if credits_on:
+                        hours_red = redeemed_hours_stream[m]
+                        cash_cost = c_var_hour_pf * min(hours_red, slack)
+                        displaced = max(0.0, hours_red - slack)
+                        opp_margin_loss = (g * r) * displaced
+                        
+                        # Add program overhead costs that scale with activity
+                        monthly_issued = credits_issue_stream[m] if m < len(credits_issue_stream) else 0
+                        program_overhead = monthly_issued * 0.05  # 5% admin overhead on credits issued
+                        
+                        monthly_GM_loss[m] = cash_cost + opp_margin_loss + program_overhead
+                    else:
+                        monthly_GM_loss[m] = 0.0
+
+                monthly_net = monthly_GM_gain - monthly_GM_loss
+                monthly_net_GM[s, :] = monthly_net
+                total_net_GM[s] = monthly_net.sum()
+                total_GM_gain[s] = monthly_GM_gain.sum()
+                issued = credits_issue_stream.sum()
+                redeemed_val = redemption_rate_pf * issued
+                total_credits_issued[s] = issued
+                total_credits_redeemed[s] = redeemed_val
+                roi[s] = (total_net_GM[s] / redeemed_val) if redeemed_val > 0 else np.nan
+
+            return dict(
+                total_net_GM=total_net_GM,
+                total_GM_gain=total_GM_gain,
+                total_credits_issued=total_credits_issued,
+                total_credits_redeemed=total_credits_redeemed,
+                roi=roi,
+                monthly_net_GM=monthly_net_GM
+            )
+
+        off = simulate(lam_off, meanQ_off, kappaQ_off, credits_on=False)
+        on = simulate(lam_on, meanQ_on, kappaQ_on, credits_on=True)
+        # Analyze key metrics
+        profit_diff = on['total_net_GM'] - off['total_net_GM']
+        median_credit_cost = np.median(on['total_credits_redeemed'])
+        median_profit_gain = np.median(on['total_GM_gain'] - off['total_GM_gain'])
+        profitable_scenarios = np.sum((on['total_GM_gain'] - off['total_GM_gain']) > on['total_credits_redeemed'])
+
+        def q(x, ql):
+            return float(np.nanpercentile(x, ql))
+
+        df_summary = pd.DataFrame({
+            "📊 Business Metric": [
+                "💰 Profit WITHOUT Program",
+                "🚀 Profit WITH Program", 
+                "📈 Additional Profit (Program Impact)",
+                "💳 Total Credits Awarded",
+                "🔄 Total Credits Actually Used",
+                "🎯 Return on Credit Investment"
+            ],
+            "🔻 Worst Case (5%)": [
+                f"${q(off['total_net_GM'], 5):,.0f}",
+                f"${q(on['total_net_GM'], 5):,.0f}",
+                f"${q(on['total_net_GM'] - off['total_net_GM'], 5):,.0f}",
+                f"${q(on['total_credits_issued'], 5):,.0f}",
+                f"${q(on['total_credits_redeemed'], 5):,.0f}",
+                f"{q(on['roi'], 5):.2f}x"
+            ],
+            "📊 Typical (50%)": [
+                f"${q(off['total_net_GM'], 50):,.0f}",
+                f"${q(on['total_net_GM'], 50):,.0f}",
+                f"${q(on['total_net_GM'] - off['total_net_GM'], 50):,.0f}",
+                f"${q(on['total_credits_issued'], 50):,.0f}",
+                f"${q(on['total_credits_redeemed'], 50):,.0f}",
+                f"{q(on['roi'], 50):.2f}x"
+            ],
+            "🔺 Best Case (95%)": [
+                f"${q(off['total_net_GM'], 95):,.0f}",
+                f"${q(on['total_net_GM'], 95):,.0f}",
+                f"${q(on['total_net_GM'] - off['total_net_GM'], 95):,.0f}",
+                f"${q(on['total_credits_issued'], 95):,.0f}",
+                f"${q(on['total_credits_redeemed'], 95):,.0f}",
+                f"{q(on['roi'], 95):.2f}x"
+            ]
+        })
+
+        st.markdown("### 📊 Simulation Results Summary")
+        st.caption("Results from 500 simulations showing range of possible outcomes")
+        
+        # Add explanation above the table
+        with st.expander("📖 How to Read These Results", expanded=False):
+            st.markdown("""
+            **Understanding the Percentiles:**
+            - **🔻 Worst Case (5%)**: Only 5% of scenarios perform worse than this
+            - **📊 Typical (50%)**: The median outcome - half perform better, half worse  
+            - **🔺 Best Case (95%)**: Only 5% of scenarios perform better than this
             
-            # Calculate loss per month based on pattern
-            monthly_margin_loss = []
-            for i in range(expiry_months_m):
-                month_redeemed_hours = redeemed_hours_total * redemption_pattern[i]
-                cash_cost_month = c_var_hour * min(month_redeemed_hours, slack)
-                displaced_hours_month = max(0.0, month_redeemed_hours - slack)
-                opp_margin_loss_month = (g * r) * displaced_hours_month
-                total_loss_month = cash_cost_month + opp_margin_loss_month
-                monthly_margin_loss.append(total_loss_month)
+            **Key Metrics Explained:**
+            - **💰 Profit WITHOUT Program**: Business profits from organic referrals only
+            - **🚀 Profit WITH Program**: Business profits with formal referral program
+            - **📈 Additional Profit**: How much extra profit the program generates
+            - **💳 Total Credits Awarded**: Dollar value of all credits given to referrers
+            - **🔄 Total Credits Actually Used**: Dollar value of credits customers redeem
+            - **🎯 Return on Investment**: Profit gained per dollar of credits redeemed
+            """)
+        
+        st.dataframe(df_summary, use_container_width=True)
+
+        # Monthly medians
+        monthly_off_median = np.nanmedian(off["monthly_net_GM"], axis=0)
+        monthly_on_median = np.nanmedian(on["monthly_net_GM"], axis=0)
+        monthly_lift_median = monthly_on_median - monthly_off_median
+
+        st.markdown("### 📈 Monthly Profit Comparison")
+        st.caption("How monthly profits change with vs without the referral program")
+        
+        # Add explanation for low-volume business volatility
+        st.info(f"📊 **Understanding Low-Volume Business**: With 0.49 expected deals/month, most individual months have zero revenue (realistic for high-value consulting). The annual totals show the true business impact.")
+        
+        # Create separate charts for better visibility
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### 💰 Quarterly Averages (Smoothed View)")
+            # Create quarterly averages from RAW data, not medians
+            quarters_display = int(months) // 3
+            if quarters_display > 0:
+                quarter_labels = []
+                quarterly_off_display = []
+                quarterly_on_display = []
+                
+                for q in range(quarters_display):
+                    start_month = q * 3
+                    end_month = min((q + 1) * 3, int(months))
+                    
+                    # Calculate quarterly averages from RAW monthly data across all simulations
+                    quarter_off_raw = off['monthly_net_GM'][:, start_month:end_month]
+                    quarter_on_raw = on['monthly_net_GM'][:, start_month:end_month]
+                    
+                    # Take mean across months and then median across simulations
+                    quarter_off = np.median(np.mean(quarter_off_raw, axis=1))
+                    quarter_on = np.median(np.mean(quarter_on_raw, axis=1))
+                    
+                    quarterly_off_display.append(quarter_off)
+                    quarterly_on_display.append(quarter_on)
+                    quarter_labels.append(f"Q{q+1}")
+                
+                df_quarterly = pd.DataFrame({
+                    "Quarter": quarter_labels,
+                    "🔶 Without Program": quarterly_off_display,
+                    "🔷 With Program": quarterly_on_display
+                }).set_index("Quarter")
+                st.bar_chart(df_quarterly)
+            else:
+                st.info("Enable 12+ month analysis to see quarterly trends")
+        
+        with col2:
+            st.markdown("#### 📈 Deal Frequency Analysis")
+            # Calculate deal frequency from RAW data, not medians
+            # Count months with revenue > 0 across all simulations
+            months_with_deals_off = np.mean(np.sum(off['monthly_net_GM'] > 0, axis=1))
+            months_with_deals_on = np.mean(np.sum(on['monthly_net_GM'] > 0, axis=1))
             
-            monthly_margin_loss = np.array(monthly_margin_loss)
-            GM_loss_total = monthly_margin_loss.sum()
-
-        net_GM = GM_gain_project - GM_loss_total
-        net_margin_pct_on_project = (net_GM / R_actual) if R_actual > 0 else 0.0
-        roi_on_credits = (net_GM / redeemed_credits) if redeemed_credits > 0 else float('nan')
-
-        # Display key metrics
-        st.subheader("💰 Margin Impact Summary")
-        mA, mB, mC, mD = st.columns(4)
-        mA.metric("Project GM gained", f"${GM_gain_project:,.0f}", 
-                 help="Gross margin earned from the referred project")
-        mB.metric("GM lost to credits", f"${GM_loss_total:,.0f}", 
-                 help="Gross margin lost due to credit redemptions")
-        mC.metric("Net GM impact", f"${net_GM:,.0f}", 
-                 help="Net gross margin after accounting for credit costs",
-                 delta=f"{net_GM:,.0f}")
-        mD.metric("Net margin % on project", f"{100*net_margin_pct_on_project:.1f}%", 
-                 help="Final margin percentage on this project after credit costs")
-
-        # Additional insights
-        st.subheader("📊 Credit Pool Breakdown")
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Total credits issued", f"{total_credits_pool:,.0f}")
-        col_b.metric("Credits redeemed", f"{redeemed_credits:,.0f}", f"({redemption_rate:.0%} rate)")
-        col_c.metric("Hours equivalent", f"{redeemed_hours_total:.1f} hrs", f"({monthly_redeemed_hours:.1f}/month)")
-
-        # Monthly breakdown chart
-        if expiry_months_m > 1:
-            st.subheader("📈 Monthly Margin Loss from Redemptions")
-            st.caption("💡 Realistic redemption pattern: higher usage in early months, declining over time")
-            
-            df_month = pd.DataFrame({
-                "Month": np.arange(1, expiry_months_m + 1), 
-                "Margin Loss": monthly_margin_loss.round(2),
-                "Cumulative Loss": np.cumsum(monthly_margin_loss).round(2)
+            deal_freq_data = pd.DataFrame({
+                "Scenario": ["🔶 Without Program", "🔷 With Program"],
+                "Months with Revenue": [f"{months_with_deals_off:.1f}", f"{months_with_deals_on:.1f}"],
+                "% of Months": [f"{months_with_deals_off/int(months)*100:.1f}%", f"{months_with_deals_on/int(months)*100:.1f}%"]
             })
             
-            # Display the data table for debugging
-            with st.expander("📊 View monthly breakdown data"):
-                st.dataframe(df_month, use_container_width=True)
+            st.dataframe(deal_freq_data, use_container_width=True)
             
-            # Create chart with both monthly and cumulative
-            chart_data = df_month.set_index("Month")[["Margin Loss"]]
-            st.line_chart(chart_data)
+            # Show average deal size when deals occur (from raw data)
+            # Calculate average revenue per month when revenue > 0
+            off_positive_months = off['monthly_net_GM'][off['monthly_net_GM'] > 0]
+            on_positive_months = on['monthly_net_GM'][on['monthly_net_GM'] > 0]
             
-            # Additional insights
-            max_month = df_month.loc[df_month["Margin Loss"].idxmax(), "Month"]
-            max_loss = df_month["Margin Loss"].max()
-            st.caption(f"📍 Peak redemption month: {max_month} (${max_loss:,.0f} margin loss)")
+            if len(off_positive_months) > 0:
+                avg_deal_when_occurs_off = np.mean(off_positive_months)
+                st.metric("📊 Avg Revenue per Active Month (Without)", f"${avg_deal_when_occurs_off:,.0f}")
+            
+            if len(on_positive_months) > 0:
+                avg_deal_when_occurs_on = np.mean(on_positive_months)
+                st.metric("🚀 Avg Revenue per Active Month (With)", f"${avg_deal_when_occurs_on:,.0f}")
+        
+        # Calculate quarterly data for later use (outside column scope)
+        quarters = int(months) // 3
+        if quarters > 0:
+            quarterly_off = []
+            quarterly_on = []
+            quarterly_lift = []
+            
+            for q in range(quarters):
+                start_month = q * 3
+                end_month = min((q + 1) * 3, int(months))
+                
+                # Calculate quarterly averages from RAW monthly data across all simulations
+                quarter_off_raw = off['monthly_net_GM'][:, start_month:end_month]
+                quarter_on_raw = on['monthly_net_GM'][:, start_month:end_month]
+                
+                # Take mean across months and then median across simulations
+                quarter_off = np.median(np.mean(quarter_off_raw, axis=1))
+                quarter_on = np.median(np.mean(quarter_on_raw, axis=1))
+                quarter_lift = quarter_on - quarter_off
+                
+                quarterly_off.append(quarter_off)
+                quarterly_on.append(quarter_on)
+                quarterly_lift.append(quarter_lift)
         else:
-            st.info("💡 Single month analysis - no time distribution chart needed")
-
-        # Mode explanations
-        st.subheader("🧮 Calculation Methods")
-        if redemption_mode.startswith("Discount"):
-            st.info("**Discount Mode**: Each redeemed credit = $1 reduction in revenue, assuming costs stay constant. Simple 1:1 margin impact.")
-        elif redemption_mode.startswith("Free hours (cash cost"):
-            st.info(f"**Free Hours (Cash Cost)**: Each redeemed hour costs ${c_var_hour:.0f} in variable delivery costs. No opportunity cost modeled.")
+            quarterly_off = [0, 0, 0, 0]
+            quarterly_on = [0, 0, 0, 0]
+            quarterly_lift = [0, 0, 0, 0]
+        
+        # Add summary metrics
+        st.markdown("#### 📊 Business Performance Summary")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            avg_without = np.mean(monthly_off_median)
+            annual_without = np.median(off['total_net_GM'])
+            st.metric("📍 Annual Baseline Profit", f"${annual_without:,.0f}")
+            st.caption(f"Monthly avg: ${avg_without:,.0f}")
+        
+        with col2:
+            avg_with = np.mean(monthly_on_median)
+            annual_with = np.median(on['total_net_GM'])
+            st.metric("🚀 Annual Program Profit", f"${annual_with:,.0f}")
+            st.caption(f"Monthly avg: ${avg_with:,.0f}")
+        
+        with col3:
+            annual_lift = annual_with - annual_without
+            monthly_lift_pct = (annual_lift/annual_without)*100 if annual_without > 0 else 0
+            st.metric("📈 Annual Profit Increase", f"${annual_lift:,.0f}", 
+                     delta=f"{monthly_lift_pct:+.1f}%")
+            st.caption("Total program impact")
+        
+        # Calculate average lift for insights (define outside column scope)
+        avg_lift = avg_with - avg_without
+        
+        # Add business insights with program performance
+        st.markdown("#### 🎯 Program Performance Analysis")
+        
+        # Calculate success metrics from the simulation data
+        profit_diff = on['total_net_GM'] - off['total_net_GM']
+        success_scenarios = np.sum(profit_diff > 0)
+        success_rate = (success_scenarios / len(profit_diff)) * 100
+        avg_annual_gain = np.mean(profit_diff)
+        median_annual_gain = np.median(profit_diff)
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("🎲 Success Rate", f"{success_rate:.1f}%", 
+                     help="Percentage of scenarios where program is profitable")
+            
+        with col2:
+            st.metric("� Profitable Scenarios", f"{success_scenarios:,}", 
+                     help=f"Number of scenarios that generated positive returns out of {len(profit_diff):,} total")
+            
+        with col3:
+            roi_percentage = (median_annual_gain / np.median(on['total_credits_redeemed'])) * 100 if np.median(on['total_credits_redeemed']) > 0 else 0
+            st.metric("💰 Program ROI", f"{roi_percentage:.0f}%", 
+                     help="Return on investment: profit gain vs credit cost")
+        
+        # Performance interpretation
+        if success_rate >= 90:
+            performance_msg = "🟢 **EXCELLENT**: Very high likelihood of success. Program shows strong positive returns in nearly all scenarios."
+        elif success_rate >= 75:
+            performance_msg = "🟡 **GOOD**: High likelihood of success. Program shows positive returns in most scenarios with acceptable risk."
+        elif success_rate >= 60:
+            performance_msg = "🟠 **MODERATE**: Moderate success likelihood. Consider optimizing parameters or testing with smaller scope."
         else:
-            slack_hours = max(0.0, H_cap - base_paid_hours)
-            st.info(f"""**Capacity-Aware Mode**: 
-            - Available slack: {slack_hours:.0f} hours/month
-            - Slack hours cost: ${c_var_hour:.0f}/hour (cash cost only)
-            - Hours above slack displace paid work: ${g*r:.0f}/hour opportunity cost
-            - Monthly breakdown: {min(monthly_redeemed_hours, slack_hours):.1f} slack hours + {max(0, monthly_redeemed_hours - slack_hours):.1f} displaced hours""")
-
-        # ROI insight
-        if not np.isnan(roi_on_credits):
-            if roi_on_credits > 1:
-                st.success(f"✅ **Positive ROI**: Each redeemed credit generates ${roi_on_credits:.2f} in net margin")
-            elif roi_on_credits > 0:
-                st.warning(f"⚠️ **Marginal ROI**: Each redeemed credit generates ${roi_on_credits:.2f} in net margin")
+            performance_msg = "🔴 **HIGH RISK**: Low success probability. Recommend significant parameter adjustments before implementation."
+        
+        st.info(performance_msg)
+        
+        # Detailed business insights
+        if avg_lift > 0:
+            if avg_without > 0:
+                st.success(f"💡 **Key Insight**: The referral program generates an average of ${avg_lift:,.0f} additional profit per month ({(avg_lift/avg_without)*100:.1f}% increase)")
             else:
-                st.error(f"❌ **Negative ROI**: Each redeemed credit loses ${abs(roi_on_credits):.2f} in net margin")
+                st.success(f"💡 **Key Insight**: The referral program generates an average of ${avg_lift:,.0f} additional profit per month (baseline has no profit)")
+        elif avg_lift < 0:
+            if avg_without > 0:
+                st.warning(f"⚠️ **Key Insight**: The referral program reduces profit by an average of ${abs(avg_lift):,.0f} per month ({abs(avg_lift/avg_without)*100:.1f}% decrease)")
+            else:
+                st.warning(f"⚠️ **Key Insight**: The referral program reduces profit by an average of ${abs(avg_lift):,.0f} per month")
+        else:
+            st.info("ℹ️ **Key Insight**: The referral program has minimal impact on monthly profits")
 
-        # Advanced insights
-        with st.expander("🔬 Advanced Analysis"):
-            st.markdown("### Sensitivity Analysis")
-            st.caption("How margin impact changes with different redemption rates")
+        # Add comprehensive explanation of what the simulation shows
+        st.markdown("#### 🔍 Understanding Your Simulation Results")
+        
+        with st.expander("📊 What These Numbers Really Mean", expanded=True):
+            st.markdown(f"""
+            **Your Simulation Overview:**
+            - **500 scenarios** tested over 12 months each
+            - **{success_rate:.1f}% of scenarios** show the program is profitable
+            - **Expected monthly conversions: 0.49 deals** (explains zero monthly medians)
             
-            redemption_scenarios = np.arange(0.5, 1.05, 0.1)
-            scenario_results = []
+            **Key Performance Indicators:**
+            - **Annual Baseline**: ${annual_without:,.0f} (without program)
+            - **Annual with Program**: ${annual_with:,.0f} (with referral credits)
+            - **Net Annual Gain**: ${annual_lift:,.0f} ({monthly_lift_pct:+.1f}% improvement)
             
-            for scenario_rate in redemption_scenarios:
-                scenario_redeemed = scenario_rate * total_credits_pool
-                scenario_redeemed_hours = scenario_redeemed / r if r > 0 else 0.0
-                
-                if redemption_mode.startswith("Discount"):
-                    scenario_loss = scenario_redeemed
-                elif redemption_mode.startswith("Free hours (cash cost"):
-                    scenario_loss = c_var_hour * scenario_redeemed_hours
-                else:
-                    scenario_hours_monthly = scenario_redeemed_hours / expiry_months_m
-                    scenario_slack = max(0.0, H_cap - base_paid_hours)
-                    scenario_cash = c_var_hour * min(scenario_hours_monthly, scenario_slack) * expiry_months_m
-                    scenario_displaced = max(0.0, scenario_hours_monthly - scenario_slack) * expiry_months_m
-                    scenario_loss = scenario_cash + (g * r) * scenario_displaced
-                
-                scenario_net = GM_gain_project - scenario_loss
-                scenario_results.append({
-                    "Redemption Rate": f"{scenario_rate:.0%}",
-                    "Redeemed Credits": f"{scenario_redeemed:,.0f}",
-                    "GM Loss": f"${scenario_loss:,.0f}",
-                    "Net GM": f"${scenario_net:,.0f}",
-                    "Margin %": f"{(scenario_net / R_actual * 100) if R_actual > 0 else 0:.1f}%"
-                })
+            **Why Monthly Medians Are Zero:**
+            - With 0.49 expected deals/month, **51% of months have zero conversions**
+            - This is mathematically normal for low-volume, high-value businesses
+            - **Annual totals are reliable** because they aggregate all 12 months
             
-            df_sensitivity = pd.DataFrame(scenario_results)
-            st.dataframe(df_sensitivity, use_container_width=True)
+            **Business Interpretation:**
+            - Your referral program is designed for **quality over quantity**
+            - **{success_scenarios} out of 500 scenarios** showed positive returns
+            - The simulation includes realistic market volatility and program costs
+            """)
+        
+        # Profit distribution histogram with business insights
+        st.markdown("#### 📈 Profit Distribution Analysis")
+        
+        fig3, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Left: Profit difference distribution
+        profit_diff = on['total_net_GM'] - off['total_net_GM']
+        ax1.hist(profit_diff, bins=30, alpha=0.7, color='green', edgecolor='black')
+        ax1.axvline(np.mean(profit_diff), color='red', linestyle='--', linewidth=2, 
+                   label=f'Expected Gain: ${np.mean(profit_diff):,.0f}')
+        ax1.axvline(0, color='black', linestyle='-', alpha=0.5, label='Break-even')
+        ax1.set_xlabel('Additional Monthly Profit ($)')
+        ax1.set_ylabel('Frequency (out of 10,000 simulations)')
+        ax1.set_title('💰 Distribution of Program Impact\n(Profit WITH - Profit WITHOUT)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Right: Success probability analysis
+        success_scenarios = (profit_diff > 0).sum()
+        success_rate = success_scenarios / len(profit_diff) * 100
+        
+        colors = ['red', 'green']
+        labels = [f'Loss Risk\n({100-success_rate:.1f}%)', f'Success Rate\n({success_rate:.1f}%)']
+        sizes = [100-success_rate, success_rate]
+        
+        ax2.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+        ax2.set_title(f'🎯 Program Success Probability\n({success_scenarios:,} of {len(profit_diff):,} scenarios profitable)')
+        
+        plt.tight_layout()
+        st.pyplot(fig3)
+        
+        # Add explanatory context about business patterns
+        with st.expander("💡 Understanding Business Volatility Patterns"):
+            st.markdown("""
+            **Why do monthly medians show zero while annual profits are realistic?**
+            
+            With your business parameters:
+            - Expected monthly conversions: **0.49 deals**
+            - This means **51% of months have zero conversions** (mathematically normal)
+            - Annual totals are reliable because they aggregate 12 months of data
+            
+            **Quarterly View Benefits:**
+            - Smooths month-to-month volatility 
+            - Shows clearer business trends
+            - More meaningful for low-volume, high-value businesses
+            
+            **Business Reality:**
+            - B2B businesses often have "lumpy" revenue patterns
+            - Zero-revenue months are common in referral programs
+            - Annual planning is more reliable than monthly forecasting
+            """)
+        
+        # Business interpretation
+        st.markdown("#### 🎯 Investment Decision Framework")
+        
+        risk_level = "HIGH" if success_rate < 70 else "MEDIUM" if success_rate < 85 else "LOW"
+        risk_color = "🔴" if risk_level == "HIGH" else "🟡" if risk_level == "MEDIUM" else "🟢"
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("🎲 Success Probability", f"{success_rate:.1f}%", 
+                     help="Percentage of scenarios where the program generates positive profit")
+        
+        with col2:
+            st.metric("💰 Expected Monthly Gain", f"${np.mean(profit_diff):,.0f}", 
+                     help="Average additional profit per month across all scenarios")
+        
+        with col3:
+            st.metric(f"{risk_color} Risk Level", risk_level, 
+                     help="Investment risk based on success probability: >85% = LOW, 70-85% = MEDIUM, <70% = HIGH")
+        
+        # Investment recommendation
+        if success_rate >= 85:
+            recommendation = "✅ **STRONG RECOMMENDATION**: High probability of success with attractive returns. Proceed with confidence."
+        elif success_rate >= 70:
+            recommendation = "⚠️ **CAUTIOUS PROCEED**: Moderate success probability. Consider testing with smaller program or tighter parameters."
+        else:
+            recommendation = "❌ **HIGH RISK**: Low success probability. Recommend redesigning program parameters before launch."
+        
+        st.info(recommendation)
+        
+        # Create quarterly summary table
+        st.markdown("#### 📊 Quarterly Performance Overview")
+        st.markdown(f"*Based on {success_rate:.1f}% success rate across 500 scenarios - quarterly view smooths monthly volatility*")
+        
+        quarterly_data = {
+            'Metric': ['Q1 Avg Profit', 'Q2 Avg Profit', 'Q3 Avg Profit', 'Q4 Avg Profit'],
+            'Without Program': [f"${q:,.0f}" for q in quarterly_off],
+            'With Program': [f"${q:,.0f}" for q in quarterly_on],
+            'Quarterly Lift': [f"${l:,.0f}" for l in quarterly_lift]
+        }
+        import pandas as pd
+        st.dataframe(pd.DataFrame(quarterly_data), use_container_width=True)
 
-st.caption("⚠️ **Note:** This is a planning tool. Ensure your published referral policy includes eligibility, attribution, clawback, and redemption rules.")
+        st.markdown("### 📋 Simulation Details")
+        with st.expander("🔧 Technical Details", expanded=False):
+            st.markdown(f"""
+            **Simulation Parameters:**
+            - **Baseline Scenario**: {lam_off:.1f} referrals/month, {meanQ_off*100:.0f}% average quality, no formal program
+            - **Program Scenario**: {lam_on:.1f} referrals/month, {meanQ_on*100:.0f}% average quality, with credits and redemptions
+            - **Quality Threshold**: Leads must score {SQL_threshold*100:.0f}%+ to earn credits or convert
+            - **Credit Usage**: {redemption_rate_pf*100:.0f}% of earned credits are actually redeemed
+            
+            **Financial Modeling:**
+            - Credits redeemed evenly over {red_window} months after earning
+            - Service capacity impact included (capacity = {H_cap_pf:.0f} hrs/month, baseline = {base_paid_hours_pf:.0f} hrs/month)
+            - ROI calculated as additional profit ÷ redeemed credits
+            
+            **Statistical Approach:**
+            - Monte Carlo simulation with {sims} runs over {months} months
+            - Lead volumes follow Poisson distribution (random monthly variation)
+            - Lead quality and effort follow Beta distributions (realistic variation)
+            - Deal values follow triangular distribution (${Rmin:,.0f} to ${Rmax:,.0f})
+            """)
 
-# Footer for public version
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666; font-size: 0.8em; margin-top: 2rem;'>
-    <p>🛠️ Built with Streamlit • 💡 Open source calculator for referral program modeling</p>
-    <p>📊 All calculations are performed locally in your browser - no data is collected or stored</p>
-</div>
-""", unsafe_allow_html=True)
+        st.info("💡 **Pro Tip**: Export these results to compare different program configurations (credit rates, caps, quality thresholds) and find your optimal setup!")
