@@ -158,23 +158,11 @@ phi = np.array([phi1, phi2, phi3], dtype=float)
 phi = phi / phi.sum() if phi.sum() > 0 else np.array([0.0, 0.0, 0.0])
 milestone_amounts = (CC_paid * phi).round(2)
 
-# Verification: Check if milestones add up to CC_paid
-milestone_total = milestone_amounts.sum()
-milestone_diff = abs(CC_paid - milestone_total)
-
 milestone_df = pd.DataFrame({
     "Milestone": ["Deposit (φ₁)", "Design sign-off (φ₂)", "Final payment (φ₃)"],
     "Share": phi.round(3),
     "Credit payout": milestone_amounts
 })
-
-# Add a total row to verify the sum
-milestone_total_row = pd.DataFrame({
-    "Milestone": ["💡 TOTAL"],
-    "Share": [1.000],
-    "Credit payout": [milestone_total]
-})
-milestone_df = pd.concat([milestone_df, milestone_total_row], ignore_index=True)
 
 # Upsell kicker
 kicker_amount = 0.0
@@ -212,12 +200,6 @@ with col3:
 st.markdown("#### Conversion Credit Milestones")
 st.caption("📅 When credits get paid out during the project")
 st.dataframe(milestone_df, use_container_width=True)
-
-# Show milestone verification
-if milestone_diff > 0.01:  # If difference is more than 1 cent
-    st.warning(f"⚠️ **Milestone Verification**: Total milestones ({milestone_total:,.2f}) vs CC_paid ({CC_paid:,.2f}) - Difference: {milestone_diff:,.2f}")
-else:
-    st.success(f"✅ **Milestone Verification**: Milestones add up correctly ({milestone_total:,.2f} = {CC_paid:,.2f})")
 
 if enable_kicker and R_upsell > 0:
     st.markdown("#### Upsell Kicker (Separate)")
