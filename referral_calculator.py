@@ -4,10 +4,23 @@ import pandas as pd
 import streamlit as st
 import json
 
-st.set_page_config(page_title="Referral Credit Calculator", layout="wide")
+st.set_page_config(
+    page_title="Referral Credit Calculator", 
+    page_icon="💰",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://github.com/yourusername/referral-credit-calculator',
+        'Report a bug': "https://github.com/yourusername/referral-credit-calculator/issues",
+        'About': "# Referral Credit Calculator\nA tool for modeling loyalty program credits based on lead quality and conversion probability."
+    }
+)
 
-st.title("Referral Credit Calculator")
-st.caption("Model: lead credits based on expected margin and conversion probability; conversion credits based on realized revenue. Tunable guardrails to protect margin.")
+st.title("💰 Referral Credit Calculator")
+st.caption("🎯 Model: lead credits based on expected margin and conversion probability; conversion credits based on realized revenue. Tunable guardrails to protect margin.")
+
+# Add a public info banner
+st.info("🌟 **Public Demo** - This calculator helps you design fair and profitable referral programs. All calculations happen in your browser - no data is stored or shared.")
 
 # -----------------------------
 # Helpers
@@ -228,4 +241,13 @@ scenario = {
 scenario_json = json.dumps(scenario, indent=2)
 st.download_button("📁 Download scenario as JSON", data=scenario_json, file_name="referral_scenario.json", mime="application/json")
 
-st.caption("⚠️ Note: This is a planning tool. Ensure your published referral policy includes eligibility, attribution, clawback, and redemption rules.")
+st.caption("⚠️ **Note:** This is a planning tool. Ensure your published referral policy includes eligibility, attribution, clawback, and redemption rules.")
+
+# Footer for public version
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666; font-size: 0.8em; margin-top: 2rem;'>
+    <p>🛠️ Built with Streamlit • 💡 Open source calculator for referral program modeling</p>
+    <p>📊 All calculations are performed locally in your browser - no data is collected or stored</p>
+</div>
+""", unsafe_allow_html=True)
