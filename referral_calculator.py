@@ -293,20 +293,35 @@ with tab_margin:
         if redemption_mode.startswith("Discount"):
             # Each 1 unit of discount reduces margin by 1 unit (costs assumed unchanged)
             GM_loss_total = redeemed_credits
-            monthly_margin_loss = np.repeat(GM_loss_total / expiry_months_m, expiry_months_m)
+            # Create a more realistic redemption pattern - higher in early months
+            redemption_pattern = np.exp(-0.1 * np.arange(expiry_months_m))
+            redemption_pattern = redemption_pattern / redemption_pattern.sum()
+            monthly_margin_loss = GM_loss_total * redemption_pattern
         elif redemption_mode.startswith("Free hours (cash cost"):
             # Cash cost only; no opportunity displacement modeled
             GM_loss_total = c_var_hour * redeemed_hours_total
-            monthly_margin_loss = np.repeat(GM_loss_total / expiry_months_m, expiry_months_m)
+            # Create redemption pattern for hours usage
+            redemption_pattern = np.exp(-0.1 * np.arange(expiry_months_m))
+            redemption_pattern = redemption_pattern / redemption_pattern.sum()
+            monthly_margin_loss = GM_loss_total * redemption_pattern
         else:
             # Capacity-aware approximation
             slack = max(0.0, H_cap - base_paid_hours)
-            # For each month, some portion of free hours consumes slack (cash cost), rest displaces paid hours (lost margin)
-            cash_cost_per_month = c_var_hour * min(monthly_redeemed_hours, slack)
-            displaced_hours = max(0.0, monthly_redeemed_hours - slack)
-            opp_margin_loss_per_month = (g * r) * displaced_hours
-            monthly_margin_loss_amount = cash_cost_per_month + opp_margin_loss_per_month
-            monthly_margin_loss = np.repeat(monthly_margin_loss_amount, expiry_months_m)
+            # Create monthly pattern for capacity-aware mode
+            redemption_pattern = np.exp(-0.1 * np.arange(expiry_months_m))
+            redemption_pattern = redemption_pattern / redemption_pattern.sum()
+            
+            # Calculate loss per month based on pattern
+            monthly_margin_loss = []
+            for i in range(expiry_months_m):
+                month_redeemed_hours = redeemed_hours_total * redemption_pattern[i]
+                cash_cost_month = c_var_hour * min(month_redeemed_hours, slack)
+                displaced_hours_month = max(0.0, month_redeemed_hours - slack)
+                opp_margin_loss_month = (g * r) * displaced_hours_month
+                total_loss_month = cash_cost_month + opp_margin_loss_month
+                monthly_margin_loss.append(total_loss_month)
+            
+            monthly_margin_loss = np.array(monthly_margin_loss)
             GM_loss_total = monthly_margin_loss.sum()
 
         net_GM = GM_gain_project - GM_loss_total
@@ -336,11 +351,28 @@ with tab_margin:
         # Monthly breakdown chart
         if expiry_months_m > 1:
             st.subheader("📈 Monthly Margin Loss from Redemptions")
+            st.caption("💡 Realistic redemption pattern: higher usage in early months, declining over time")
+            
             df_month = pd.DataFrame({
                 "Month": np.arange(1, expiry_months_m + 1), 
-                "GM Loss ($)": monthly_margin_loss
+                "Margin Loss": monthly_margin_loss.round(2),
+                "Cumulative Loss": np.cumsum(monthly_margin_loss).round(2)
             })
-            st.line_chart(df_month.set_index("Month"))
+            
+            # Display the data table for debugging
+            with st.expander("📊 View monthly breakdown data"):
+                st.dataframe(df_month, use_container_width=True)
+            
+            # Create chart with both monthly and cumulative
+            chart_data = df_month.set_index("Month")[["Margin Loss"]]
+            st.line_chart(chart_data)
+            
+            # Additional insights
+            max_month = df_month.loc[df_month["Margin Loss"].idxmax(), "Month"]
+            max_loss = df_month["Margin Loss"].max()
+            st.caption(f"📍 Peak redemption month: {max_month} (${max_loss:,.0f} margin loss)")
+        else:
+            st.info("💡 Single month analysis - no time distribution chart needed")
 
         # Mode explanations
         st.subheader("🧮 Calculation Methods")
@@ -375,12 +407,14 @@ with tab_margin:
             
             for scenario_rate in redemption_scenarios:
                 scenario_redeemed = scenario_rate * total_credits_pool
+                scenario_redeemed_hours = scenario_redeemed / r if r > 0 else 0.0
+                
                 if redemption_mode.startswith("Discount"):
                     scenario_loss = scenario_redeemed
                 elif redemption_mode.startswith("Free hours (cash cost"):
-                    scenario_loss = c_var_hour * (scenario_redeemed / r)
+                    scenario_loss = c_var_hour * scenario_redeemed_hours
                 else:
-                    scenario_hours_monthly = (scenario_redeemed / r) / expiry_months_m
+                    scenario_hours_monthly = scenario_redeemed_hours / expiry_months_m
                     scenario_slack = max(0.0, H_cap - base_paid_hours)
                     scenario_cash = c_var_hour * min(scenario_hours_monthly, scenario_slack) * expiry_months_m
                     scenario_displaced = max(0.0, scenario_hours_monthly - scenario_slack) * expiry_months_m
@@ -389,8 +423,10 @@ with tab_margin:
                 scenario_net = GM_gain_project - scenario_loss
                 scenario_results.append({
                     "Redemption Rate": f"{scenario_rate:.0%}",
-                    "Net GM": scenario_net,
-                    "Margin %": (scenario_net / R_actual * 100) if R_actual > 0 else 0
+                    "Redeemed Credits": f"{scenario_redeemed:,.0f}",
+                    "GM Loss": f"${scenario_loss:,.0f}",
+                    "Net GM": f"${scenario_net:,.0f}",
+                    "Margin %": f"{(scenario_net / R_actual * 100) if R_actual > 0 else 0:.1f}%"
                 })
             
             df_sensitivity = pd.DataFrame(scenario_results)
